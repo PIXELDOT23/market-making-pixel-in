@@ -1,73 +1,79 @@
-# Fyers Equity Market Making Bot
+# FYERS Market Making Bot (Cost-Aware & Margin-Aware)
 
-A small, transparent market-making bot for a single NSE equity symbol.
-You run this on your own machine with your own credentials — nothing here
-connects back to this chat.
+A transparent, high-performance market-making bot for NSE Equities and MCX Commodities on the **FYERS API v3**.
 
-## Before you run anything
+Runs locally on your machine with your own credentials.
 
-1. **Activate your Fyers app for API trading.** SEBI's algo trading rules require
-   retail API apps to be explicitly activated with a registered static IP.
-   Do this at https://myapi.fyers.in/dashboard/. Orders will simply be rejected
-   until this is done.
-2. **Understand the risk.** Market making means you're constantly quoting both
-   a buy and a sell — you make money on the spread when both sides fill, but
-   you can get run over in a fast-moving/trending market (you keep buying as
-   price falls, or keep selling as it rises). The `MAX_POSITION_QTY` and
-   `MAX_DAILY_LOSS_RS` limits in `config.py` exist specifically to cap that,
-   but they don't eliminate it. Start with the smallest qty and tightest limits
-   you're comfortable losing, on a low-volatility large-cap stock, before
-   scaling anything up.
-3. This bot uses **REST polling** every few seconds, not a websocket feed —
-   simpler and more robust to get right first, but it means it reacts a
-   few seconds slower than a tick-by-tick market maker. Fine for small-qty,
-   wide-spread quoting; not fine if you plan to compete on very tight spreads.
+---
+
+## Key Features
+
+1. **Pre-Trade Margin Check via FYERS API v3:**
+   - Queries the official Multiorder Margin Calculator endpoint (`POST /api/v3/multiorder/margin`) before placing quotes.
+   - Verifies `margin_avail >= margin_required + MIN_FREE_MARGIN_BUFFER_RS` for both single and simultaneous two-sided quotes.
+   - Prevents order rejections due to insufficient margin or account over-leverage.
+
+2. **Accurate Transaction Cost & Breakeven Modeling:**
+   - Incorporates full statutory levies: Brokerage (₹20 or 0.03%), Exchange Transaction Charges (NSE 0.00297%, MCX 0.0026%), STT/CTT, SEBI fees (₹10/crore), Stamp Duty, and 18% GST.
+   - Auto-widens quote spread (`AUTO_WIDEN_SPREAD=True`) to clear breakeven + minimum profit margin (`MIN_PROFIT_MARGIN_TICKS`).
+   - Supports live inspection of historical broker charges via FYERS API v3 `GET /charges-history`.
+
+3. **Multi-Segment Support:**
+   - Supports both **NSE Equities** (`SEGMENT="EQUITY"`) and **MCX Commodities** (`SEGMENT="COMMODITY"`).
+   - Properly accounts for contract lot multipliers (e.g. 1250 for Natural Gas futures) in turnover, charges, and PnL calculations.
+
+4. **Multi-Mode Execution:**
+   - `bot.py`: Robust polling-based market maker (requotes every N seconds, cancels and replaces).
+   - `main.py`: Real-time WebSocket engine (`data_ws` for tick-by-tick prices and `order_ws` for instant fill callbacks).
+
+5. **Strict Risk Controls:**
+   - Max inventory caps (`MAX_POSITION_QTY`).
+   - Daily loss kill-switch (`MAX_DAILY_LOSS_RS`) with automatic market square-off.
+   - Order throttling (`MAX_ORDERS_PER_MINUTE`).
+   - Safe shutdown on `Ctrl+C` (cancels live quotes and flattens inventory).
+
+---
 
 ## Setup
 
 ```bash
-pip install fyers-apiv3
+pip install fyers-apiv3 requests python-dotenv
 ```
 
-Edit `config.py`:
-- `CLIENT_ID`, `SECRET_KEY`, `REDIRECT_URI` — from your Fyers API app
-- `SYMBOL` — which equity to make markets in (default `NSE:SBIN-EQ`)
-- `QUOTE_QTY`, `SPREAD_TICKS` — sizing and how wide you quote
-- `MAX_POSITION_QTY`, `MAX_DAILY_LOSS_RS` — your hard risk limits
-
-You can also set credentials via environment variables instead of editing
-the file directly:
+Configure `config.py` or export environment variables:
 ```bash
-export FYERS_CLIENT_ID="ABC123-100"
-export FYERS_SECRET_KEY="your_secret"
-export FYERS_REDIRECT_URI="https://127.0.0.1"
+export FYERS_CLIENT_ID="your_app_id-XXX"
+export FYERS_SECRET_KEY="your_secret_key"
+export FYERS_REDIRECT_URI="http://localhost:2000/callback"
 ```
 
-## Run
+## Running the Bot
 
-```bash
-python3 auth.py   # once per day — opens a login URL, you paste back auth_code
-python3 bot.py     # starts quoting
-```
+1. **Daily Authentication (once per day):**
+   ```bash
+   python3 auth.py
+   ```
+   Opens FYERS login in your browser, authenticates, and caches your access token to `fyers_access_token.txt`.
 
-Stop any time with `Ctrl+C` — it cancels open orders and flattens your
-position before exiting. It also auto-halts and flattens if the daily loss
-limit is breached.
+2. **Start the Polling Market Maker:**
+   ```bash
+   python3 bot.py
+   ```
 
-## Files
+3. **Or Start the WebSocket Engine:**
+   ```bash
+   python3 main.py
+   ```
 
-- `config.py` — all your settings and credentials (keep this out of git)
-- `auth.py` — one-time daily login handshake, caches the access token
-- `risk_manager.py` — position limits, loss limits, order throttling
-- `bot.py` — the quoting loop itself
+---
 
-## What this does NOT do
+## File Overview
 
-- No backtesting included — you're quoting live with real capital from the
-  first run. Consider paper-testing the logic against logged quotes first,
-  or running with `QUOTE_QTY=1` on a highly liquid stock initially.
-- No adverse-selection / volatility-based spread widening — spread is fixed
-  in ticks. A common next upgrade is widening the spread when recent price
-  volatility increases.
-- No multi-symbol support — one symbol at a time by design, to keep risk
-  contained while you test it.
+- [`config.py`](file:///home/pushpanathan/Pixel-In-Infa/market-making-pixel-in/config.py): Configuration, credentials, risk parameters, and margin buffer settings.
+- [`margin.py`](file:///home/pushpanathan/Pixel-In-Infa/market-making-pixel-in/margin.py): FYERS API v3 Margin Calculator integration (`/multiorder/margin`) and account funds inspection.
+- [`cost_model.py`](file:///home/pushpanathan/Pixel-In-Infa/market-making-pixel-in/cost_model.py): Accurate statutory fees, breakeven tick calculators, and historical charges fetcher (`/charges-history`).
+- [`risk_manager.py`](file:///home/pushpanathan/Pixel-In-Infa/market-making-pixel-in/risk_manager.py): Inventory caps, daily drawdown circuit breaker, order throttle, and margin limits.
+- [`bot.py`](file:///home/pushpanathan/Pixel-In-Infa/market-making-pixel-in/bot.py): Main polling market maker quoting loop.
+- [`main.py`](file:///home/pushpanathan/Pixel-In-Infa/market-making-pixel-in/main.py): WebSocket-driven market maker engine.
+- [`auth.py`](file:///home/pushpanathan/Pixel-In-Infa/market-making-pixel-in/auth.py): OAuth2 login handshake and token caching.
+- [`logger.py`](file:///home/pushpanathan/Pixel-In-Infa/market-making-pixel-in/logger.py): ANSI color terminal logger.
