@@ -1,0 +1,7 @@
+-- Apply this schema to your PostgreSQL instance:
+--   psql "$DATABASE_URL" -f db/schema.sql
+--
+-- If the database does not exist yet, create it first (system cluster):
+--   sudo -u postgres psql -c "CREATE USER market PASSWORD 'market';"
+--   sudo -u postgres psql -c "CREATE DATABASE market_making OWNER market;"
+--   sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE market_making TO market;"

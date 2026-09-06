@@ -33,7 +33,7 @@ end
 # Unset irrelevant variables.
 deactivate nondestructive
 
-set -gx VIRTUAL_ENV '/media/pixel-in/Pixel In/Dot/.venv'
+set -gx VIRTUAL_ENV /home/pushpanathan/Pixel-In-Infa/market-making-pixel-in/.venv
 
 set -gx _OLD_VIRTUAL_PATH $PATH
 set -gx PATH "$VIRTUAL_ENV/"bin $PATH

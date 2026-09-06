@@ -1,0 +1,6 @@
+#!/home/pushpanathan/Pixel-In-Infa/market-making-pixel-in/.venv/bin/python3
+import sys
+from watchfiles.cli import cli
+if __name__ == '__main__':
+    sys.argv[0] = sys.argv[0].removesuffix('.exe')
+    sys.exit(cli())

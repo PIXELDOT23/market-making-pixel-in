@@ -1,4 +1,4 @@
-#!/media/pixel-in/Pixel In/Dot/.venv/bin/python3
+#!/home/pushpanathan/Pixel-In-Infa/market-making-pixel-in/.venv/bin/python3
 
 import sys
 import json

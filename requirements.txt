@@ -1,0 +1,14 @@
+# --- Market-Making Pixel runtime ---
+fyers-apiv3==3.1.12
+msgspec>=0.18.5
+redis>=5.0
+psycopg[binary]>=3.1
+psycopg-pool>=3.2
+fastapi>=0.111
+uvicorn[standard]>=0.30
+python-dotenv>=1.0
+requests>=2.31
+
+# --- dev ---
+# ruff
+# pytest
