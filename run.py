@@ -37,13 +37,33 @@ def _run():
     # its `shutdown_default_executor()` has no cancellation and blocks forever
     # on any stuck broker REST thread — yet we _force_exit anyway.
     loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
     try:
+        asyncio.set_event_loop(loop)
         loop.run_until_complete(_main())
     except KeyboardInterrupt:
         log.warn("Interrupted by keyboard (Ctrl+C) — shutdown already handled.")
+    except SystemExit as exc:
+        # Intentional abort (e.g. API port already held by another instance) —
+        # not a crash. Carry its exit code without a scary traceback.
+        code = exc.code if isinstance(exc.code, int) else 1
+        log.warn(f"Aborted (exit {code}) — no engines were booted.")
+        _force_exit(code)
+    except BaseException as exc:
+        # Never swallow a real failure as a clean exit: forward the traceback
+        # and exit non-zero so the operator/kill-switch sees the error.
+        log.error(f"Unhandled {type(exc).__name__}: {exc}")
+        try:
+            loop.stop()
+        except Exception:
+            pass
+        _force_exit(1)
     finally:
-        _force_exit()
+        try:
+            if not loop.is_closed():
+                loop.close()
+        except Exception:
+            pass
+        _force_exit(0)
 
 
 if __name__ == "__main__":

@@ -9,12 +9,15 @@ network round-trip to Postgres.
 
 Tables (see db/schema.sql):
   market_ticks, signals, cost_quotes, risk_verdicts, orders, order_events,
-  decisions, engine_heartbeats, strategies
+  decisions, engine_heartbeats, strategies,
+  order_book_depths, ml_features, ml_predictions (ML persistence)
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -27,6 +30,20 @@ from psycopg_pool import AsyncConnectionPool
 from app.config import settings
 from app import schema
 
+# psycopg_pool logs every "error connecting in 'pool-1'" retry at ERROR level.
+# When Postgres is down we fully disable, but the few retries during connect()
+# still hit the console; silence them so a DB-less boot is clean.
+logging.getLogger("psycopg.pool").setLevel(logging.CRITICAL)
+logging.getLogger("psycopg.pool.AsyncConnectionPool").setLevel(logging.CRITICAL)
+
+
+class _UnknownTableError(Exception):
+    """Raised when a buffered table has no explicit INSERT handler in flush()."""
+
+    def __init__(self, table: str):
+        super().__init__(f"no INSERT handler for table {table!r}")
+        self.table = table
+
 
 class Database:
     def __init__(self, dsn: str = ""):
@@ -36,7 +53,31 @@ class Database:
         self._flush_task: Optional[asyncio.Task] = None
         self._encoder = msgspec.json.Encoder()
         self._decoder = msgspec.json.Decoder()
+        self._buf_lock = threading.Lock()
         self._lock = asyncio.Lock()
+        # Guards the buffered-write state (_pending/_buffered/_dropped). A plain
+        # threading.Lock (uncontended ~50ns) also lets synchronous, non-awaitable
+        # producers enqueue rows (e.g. the ML engine's hot path) without ever
+        # creating an un-awaited coroutine.
+        # No-op mode: set when DSN is empty/unset or Postgres is unreachable.
+        # In this mode every write is dropped and read queries return ``[]`` so
+        # the whole app runs fine without persistence (zero boot/periodic noise).
+        self._disabled = not self.dsn
+        # Rows dropped because the buffered flush exceeded ``db_pending_cap``
+        # (e.g. Postgres stays unreachable for a long time); tracked so the
+        # warning is throttled instead of spamming the hot path.
+        self._dropped = 0
+        self._last_drop_warn_ts = 0.0
+        self._logger = logging.getLogger("app.db")
+        # Running total of buffered rows: maintained O(1) on every write and
+        # resets on flush. Used to enforce ``db_pending_cap`` without re-walking
+        # the whole buffer on the hot path.
+        self._buffered = 0
+        self._last_error_log_ts = 0.0
+
+    @property
+    def disabled(self) -> bool:
+        return self._disabled or self.pool is None
 
     @staticmethod
     def _ts(value: float) -> datetime:
@@ -47,16 +88,40 @@ class Database:
 
     # ------------------------------------------------------------------ lifecycle
     async def connect(self):
-        if self.pool is None:
-            self.pool = AsyncConnectionPool(self.dsn, min_size=1, max_size=8, open=False)
-            await self.pool.open()
-            self._flush_task = asyncio.create_task(self._periodic_flush())
+        if self.pool is None and not self._disabled:
+            pool = None
+            try:
+                pool = AsyncConnectionPool(
+                    self.dsn, min_size=1, max_size=8, open=False, timeout=2
+                )
+                await asyncio.wait_for(pool.open(), timeout=5)
+                # Connectivity probe: a psycopg_pool with open=False may return
+                # before any connection succeeds and then retry in the
+                # background forever, spamming "error connecting". If the very
+                # first SELECT fails we disable completely (no retry noise).
+                async with pool.connection(timeout=5) as conn:
+                    await conn.execute("SELECT 1")
+                self.pool = pool
+                self._flush_task = asyncio.create_task(self._periodic_flush())
+            except Exception:
+                self._disabled = True
+                if pool is not None:
+                    try:
+                        await pool.close()
+                    except Exception:
+                        pass
         return self
 
     async def close(self):
         if self._flush_task:
             self._flush_task.cancel()
             self._flush_task = None
+        # Flush whatever is still buffered (e.g. the final order_events from a
+        # flatten-on-close) so an orderly shutdown doesn't lose the tail.
+        try:
+            await self.flush()
+        except Exception:
+            pass
         if self.pool is not None:
             pool, self.pool = self.pool, None
             try:
@@ -65,6 +130,8 @@ class Database:
                 pass
 
     async def ping(self) -> bool:
+        if self.disabled:
+            return False
         try:
             async with self.pool.connection() as conn:
                 await conn.execute("SELECT 1")
@@ -73,15 +140,58 @@ class Database:
             return False
 
     # ------------------------------------------------------------------ batching
-    async def buffer_write(self, table: str, row: Dict[str, Any]):
-        """Enqueue a row for the batched flush (low latency: never awaits a write)."""
-        async with self._lock:
+    def buffer_write_sync(self, table: str, row: Dict[str, Any]):
+        """Synchronous enqueue (never awaits, never blocks on I/O).
+
+        This is the safe way to enqueue from a synchronous producer such as the
+        ML engine's hot path — calling the async buffer_write() there would
+        create a coroutine that is never awaited and silently lose every row.
+
+        If the buffer is already at ``db_pending_cap`` rows the write is dropped
+        and counted; the flush-buffer can never grow unbounded and risk OOM even
+        when Postgres is down for a long stretch. Dropping here is safe because
+        the hot path (ticks/signals) is best-effort and the monitor reads back
+        whatever the DB actually persisted."""
+        if self.disabled:
+            return
+        with self._buf_lock:
+            if self._buffered >= settings.db_pending_cap:
+                self._dropped += 1
+                now = time.time()
+                if now - self._last_drop_warn_ts >= 30.0:
+                    self._last_drop_warn_ts = now
+                    self._logger.warning(
+                        "db buffer at cap=%d — dropping row (total dropped: %d). "
+                        "Postgres likely unreachable; flush will reset the counter.",
+                        settings.db_pending_cap, self._dropped,
+                    )
+                return
             self._pending.setdefault(table, []).append(row)
+            self._buffered += 1
+
+    async def buffer_write(self, table: str, row: Dict[str, Any]):
+        """Enqueue a row for the batched flush (low latency: never awaits a write).
+
+        Enqueuing is pure in-memory work, so it delegates to the synchronous
+        path; this async wrapper exists for the existing `await`-style callers."""
+        self.buffer_write_sync(table, row)
 
     async def flush(self) -> int:
-        async with self._lock:
+        if self.disabled:
+            return 0
+        with self._buf_lock:
             pending = self._pending
             self._pending = {}
+            self._buffered = 0
+            dropped = self._dropped
+            self._dropped = 0
+        if dropped:
+            self._logger.warning(
+                "flush recovered: %d buffered rows persisted; %d rows were dropped "
+                "during the outage (buffer cap %d).",
+                sum(len(rows) for rows in pending.values()), dropped,
+                settings.db_pending_cap,
+            )
         total = 0
         for table, rows in pending.items():
             if not rows:
@@ -131,16 +241,75 @@ class Database:
                                 "VALUES(%(engine)s,%(ts)s,%(status)s,%(latency_ms)s,%(processed_count)s,%(heartbeat)s::jsonb)",
                                 rows,
                             )
-                        else:
+                        elif table == "strategies":
+                            # name is the PRIMARY KEY — last-writer-wins upsert of
+                            # the live strategy registry.
                             await cur.executemany(
-                                f"INSERT INTO {table} VALUES (%s)", rows
+                                "INSERT INTO strategies(name,symbol,segment,enabled,started_ts,params) "
+                                "VALUES(%(name)s,%(symbol)s,%(segment)s,%(enabled)s,%(started_ts)s,%(params)s::jsonb) "
+                                "ON CONFLICT (name) DO UPDATE SET "
+                                "symbol=EXCLUDED.symbol, segment=EXCLUDED.segment, "
+                                "enabled=EXCLUDED.enabled, started_ts=EXCLUDED.started_ts, "
+                                "params=EXCLUDED.params",
+                                rows,
                             )
+                        elif table == "order_book_depths":
+                            await cur.executemany(
+                                "INSERT INTO order_book_depths(ts,symbol,ltp,mid,spread,bids,asks,volume,churn_tps) "
+                                "VALUES(%(ts)s,%(symbol)s,%(ltp)s,%(mid)s,%(spread)s,"
+                                "%(bids)s::jsonb,%(asks)s::jsonb,%(volume)s,%(churn_tps)s)",
+                                rows,
+                            )
+                        elif table == "ml_features":
+                            await cur.executemany(
+                                "INSERT INTO ml_features(ts,symbol,features,label,label_ts) "
+                                "VALUES(%(ts)s,%(symbol)s,%(features)s::jsonb,%(label)s,%(label_ts)s)",
+                                rows,
+                            )
+                        elif table == "ml_predictions":
+                            await cur.executemany(
+                                "INSERT INTO ml_predictions(ts,symbol,model_name,model_version,"
+                                "features,prediction,action) "
+                                "VALUES(%(ts)s,%(symbol)s,%(model_name)s,%(model_version)s,"
+                                "%(features)s::jsonb,%(prediction)s,%(action)s)",
+                                rows,
+                            )
+                        else:
+                            # A buffer write landed for a table with no flush
+                            # handler. Persisting it via a generic column-less
+                            # INSERT would never work for dict rows (and dropping
+                            # it silently hides a bug), so log it loudly and drop.
+                            await conn.rollback()
+                            raise _UnknownTableError(table)
                         await conn.commit()
                 total += len(rows)
-            except Exception:
-                # swallow persistence errors on the hot path; monitor sees the gap
-                pass
+            except _UnknownTableError as exc:
+                total += len(rows)  # nothing persisted — already dropped safely
+                remaining = self._throttle_error()
+                self._logger.warning(
+                    "db flush: no INSERT handler for table %r — dropped %d row(s) "
+                    "instead of writing invalid SQL (%s)",
+                    exc.table, len(rows), remaining,
+                )
+            except Exception as exc:
+                # Persistence is best-effort on the hot path: the monitor reads
+                # back whatever actually landed, so we never raise and never
+                # retry stale rows. Log throttled so a prolonged DB outage does
+                # not flood the console.
+                remaining = self._throttle_error()
+                self._logger.warning(
+                    "db flush to %r failed (%s) — dropped %d row(s); "
+                    "next periodic flush will retry fresh rows%s",
+                    table, type(exc).__name__, len(rows), remaining,
+                )
         return total
+
+    def _throttle_error(self) -> str:
+        now = time.time()
+        if now - self._last_error_log_ts >= 30.0:
+            self._last_error_log_ts = now
+            return ""
+        return f" (last error logged {now - self._last_error_log_ts:.0f}s ago)"
 
     async def _periodic_flush(self):
         while True:
@@ -230,4 +399,20 @@ class Database:
             "engine": hb.engine, "ts": self._ts(hb.ts), "status": hb.status,
             "latency_ms": hb.loop_latency_ms, "processed_count": hb.processed_count,
             "heartbeat": self._encoder.encode(hb).decode(),
+        })
+
+    async def insert_order_book_depth(self, depth: "schema.OrderBookDepth"):
+        await self.buffer_write("order_book_depths", {
+            "ts": self._ts(depth.ts), "symbol": depth.symbol, "ltp": depth.ltp,
+            "mid": depth.mid, "spread": depth.spread,
+            "bids": self._encoder.encode(depth.bids).decode() if depth.bids else "[]",
+            "asks": self._encoder.encode(depth.asks).decode() if depth.asks else "[]",
+            "volume": depth.volume, "churn_tps": depth.churn_tps,
+        })
+
+    async def insert_ml_prediction(self, pred: "schema.MLPrediction"):
+        await self.buffer_write("ml_predictions", {
+            "ts": self._ts(pred.ts), "symbol": pred.symbol,
+            "model_name": pred.model_name, "model_version": pred.model_version,
+            "features": "{}", "prediction": pred.prediction, "action": pred.action,
         })

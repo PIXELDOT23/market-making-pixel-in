@@ -20,12 +20,14 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Dict, List, Optional
+from collections import deque
+from typing import Deque, Dict, List, Optional
 
 from app import schema
 from app.config import settings
 from app.engines.base import Engine
 from app.infra.db import Database
+from app.infra.instrument import instrument_registry
 from app.infra.redis import RedisBus
 
 
@@ -37,16 +39,37 @@ class SignalEngine(Engine):
         self.tick_size = tick_size or settings.resolved_tick_size
         self._last: Dict[str, schema.MarketTick] = {}
         self._listener: Optional[asyncio.Task] = None
+        # Rolling (ts, ltp) history per symbol for live churn measurement — the
+        # same tick/sec of absolute movement the data engine reports in its
+        # snapshot. Bounded per symbol so whole-market scan stays flat memory.
+        self._churn_hist: Dict[str, Deque[tuple]] = {}
+
+    def _churn_from_hist(self, hist, window_sec: float, tick_size: float) -> float:
+        now = time.time()
+        cutoff = now - max(window_sec, 1.0)
+        if len(hist) < 2:
+            return 0.0
+        # walk to the first sample inside the window (deque is FIFO by ts)
+        first_i = 0
+        for i, (ts, _p) in enumerate(hist):
+            if ts >= cutoff:
+                first_i = i
+                break
+        pts = [hist[j] for j in range(first_i, len(hist))]
+        if len(pts) < 2:
+            return 0.0
+        dist = sum(abs(b - a) for (_t1, a), (_t2, b) in zip(pts, pts[1:]))
+        elapsed = pts[-1][0] - pts[0][0]
+        if elapsed <= 0 or dist <= 0:
+            return 0.0
+        return max(0.0, dist / elapsed / max(tick_size, 1e-9))
 
     def _on_market(self, channel: str, raw: bytes):
         self._last[channel] = raw
 
-    async def _decode_market(self, raw: bytes) -> schema.MarketTick:
-        return schema.decode(schema.MarketTick, raw)
-
     async def run(self):
-        def handler(ch: str, raw: bytes):
-            asyncio.create_task(self._handle(ch, raw))
+        async def handler(ch: str, raw: bytes):
+            await self._handle(ch, raw)
 
         await self.bus.subscribe("fyers:market:*", handler=handler)
         hb = asyncio.create_task(self._heartbeat_loop())
@@ -58,11 +81,8 @@ class SignalEngine(Engine):
         hb.cancel()
 
     async def _handle(self, channel: str, raw: bytes):
-        try:
-            tick = await self._decode_market(raw)
-        except Exception:
-            return
-        sig = await self.compute(tick)
+        tick = schema.decode(schema.MarketTick, raw)
+        sig = self.compute(tick)
         if sig is None:
             return
         self._mark()
@@ -72,13 +92,23 @@ class SignalEngine(Engine):
         except Exception:
             pass
 
-    async def compute(self, tick: schema.MarketTick) -> Optional[schema.SignalMetrics]:
+    def compute(self, tick: schema.MarketTick) -> Optional[schema.SignalMetrics]:
         mid = tick.bid + (tick.ask - tick.bid) / 2 if (tick.bid and tick.ask) else tick.ltp
-        spread_ticks = int(round((tick.ask - tick.bid) / self.tick_size)) if (tick.bid and tick.ask) else 0
+        # Whole-market scan mode mixes instruments with different tick sizes
+        # (NFO 0.05, MCX 0.10). Measuring spread/churn against ONE global tick
+        # silently deems half the universe un-quoteable or over-widens it, so
+        # resolve the per-symbol tick and fall back to the primary default.
+        inst = instrument_registry.get(tick.symbol)
+        tick_size = inst.tick_size if inst is not None and inst.tick_size > 0 else self.tick_size
+        spread_ticks = int(round((tick.ask - tick.bid) / tick_size)) if (tick.bid and tick.ask) else 0
 
-        # churn is computed by the data engine snapshot; approximate here from
-        # single-tick flow. Strategy engine overwrites with the snapshot metric.
-        churn = 0.0
+        # Live churn from the raw tick stream (ticks/sec of |price movement|),
+        # then demand a wider spread in fast markets. The strategy engine also
+        # falls back to the data snapshot's churn for the boot warm-up window.
+        hist = self._churn_hist.setdefault(tick.symbol, deque(maxlen=4096))
+        hist.append((tick.ts, tick.ltp))
+        churn = self._churn_from_hist(hist, settings.volatility_window_sec, tick_size)
+
         reasons: List[str] = []
         quoteable = True
 
@@ -96,6 +126,11 @@ class SignalEngine(Engine):
         widening = 0
         if churn > 0 and settings.volatility_widen_factor > 0:
             widening = int(churn * settings.volatility_widen_factor)
+        widening = min(widening, settings.max_spread_widen_ticks)
+
+        if settings.volatility_halt_quoting_tps > 0 and churn > settings.volatility_halt_quoting_tps:
+            quoteable = False
+            reasons.append("excessive churn")
 
         if spread_ticks > settings.max_spread_widen_ticks:
             quoteable = False
@@ -106,7 +141,7 @@ class SignalEngine(Engine):
             strategy="*",
             ts=tick.ts,
             mid=mid,
-            churn_ticks_per_sec=churn,
+            churn_ticks_per_sec=round(churn, 3),
             vol_widening_ticks=widening,
             liquidity_grade=round(liq, 3),
             spread_ticks_now=spread_ticks,

@@ -176,6 +176,29 @@ class TokenStore:
         return None
 
     # ------------------------------------------------------------------ coordinated re-auth
+    @staticmethod
+    def _require_credentials():
+        """Fail fast with a clear message when broker credentials are missing.
+
+        Only reached when the app actually needs to generate a fresh FYERS token —
+        reads of a cached/valid token and boot never hit this, and the stub smoke
+        identity (FYERS_CLIENT_ID=smoketest) is exempt so the smoke test can boot
+        against a DB without a real broker secret."""
+        if str(settings.client_id).lower().startswith("smoke"):
+            return
+        missing = []
+        if not settings.client_id:
+            missing.append("FYERS_CLIENT_ID")
+        if not settings.secret_key:
+            missing.append("FYERS_SECRET_KEY")
+        if missing:
+            raise RuntimeError(
+                "Cannot authenticate to FYERS: missing environment variable(s) "
+                + ", ".join(missing)
+                + ". Set them before running (see .env.example), then seed the "
+                "access token with: python scripts/fyers_login.py"
+            )
+
     def _request_new_token_interactive(self) -> AccessToken:
         """
         Runs the FYERS OAuth2 handshake (browser login). Returns the fresh token.
@@ -186,6 +209,8 @@ class TokenStore:
         or set FYERS_AUTO_LOGIN=1 to allow an inline browser handshake.
         """
         import os
+
+        self._require_credentials()
 
         if os.getenv("FYERS_AUTO_LOGIN", "0") != "1":
             raise RuntimeError(

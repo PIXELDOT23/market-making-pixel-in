@@ -1,0 +1,29 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+
+# --- Runtime artifacts ---
+*.log
+
+# --- Secrets ---
+*.env
+.env
+fyers_access_token.txt
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+*.iml
+.DS_Store
+
+# --- Frontend (Vite) ---
+frontend/node_modules/
+frontend/dist/
+
+# --- Tests / coverage ---
+.coverage
+htmlcov/
+.pytest_cache/

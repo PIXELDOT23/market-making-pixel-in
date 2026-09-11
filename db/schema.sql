@@ -101,3 +101,81 @@ CREATE TABLE IF NOT EXISTS market_snapshots (
     bid_size    BIGINT DEFAULT 0,
     ask_size    BIGINT DEFAULT 0
 );
+
+-- ============================================================================
+-- ML tables (see also db/ml_schema.sql for standalone migration)
+-- ============================================================================
+
+-- 10. Full order-book depth snapshots (5 levels, persisted every N sec)
+CREATE TABLE IF NOT EXISTS order_book_depths (
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    ts          TIMESTAMPTZ NOT NULL,
+    symbol      TEXT        NOT NULL,
+    ltp         DOUBLE PRECISION NOT NULL,
+    mid         DOUBLE PRECISION,
+    spread      DOUBLE PRECISION,
+    bids        JSONB NOT NULL DEFAULT '[]'::jsonb,
+    asks        JSONB NOT NULL DEFAULT '[]'::jsonb,
+    volume      BIGINT NOT NULL DEFAULT 0,
+    churn_tps   DOUBLE PRECISION NOT NULL DEFAULT 0.0
+);
+CREATE INDEX IF NOT EXISTS idx_obd_symbol_ts ON order_book_depths (symbol, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_obd_ts_day ON order_book_depths ((ts AT TIME ZONE 'UTC')::date);
+
+-- 11. ML feature vectors
+CREATE TABLE IF NOT EXISTS ml_features (
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    ts          TIMESTAMPTZ NOT NULL,
+    symbol      TEXT        NOT NULL,
+    features    JSONB NOT NULL,
+    label       DOUBLE PRECISION,
+    label_ts    TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_mlf_symbol_ts ON ml_features (symbol, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_mlf_labelled ON ml_features (label) WHERE label IS NOT NULL;
+
+-- 12. ML model registry
+CREATE TABLE IF NOT EXISTS ml_models (
+    id              SERIAL PRIMARY KEY,
+    name            TEXT NOT NULL,
+    version         TEXT NOT NULL,
+    model_path      TEXT NOT NULL,
+    feature_names   JSONB NOT NULL,
+    config          JSONB NOT NULL DEFAULT '{}'::jsonb,
+    train_samples   INTEGER,
+    train_auc       DOUBLE PRECISION,
+    val_auc         DOUBLE PRECISION,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    active          BOOLEAN NOT NULL DEFAULT FALSE,
+    UNIQUE(name, version)
+);
+CREATE INDEX IF NOT EXISTS idx_mlm_name_active ON ml_models (name, active) WHERE active = TRUE;
+
+-- 13. ML prediction log
+CREATE TABLE IF NOT EXISTS ml_predictions (
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    ts          TIMESTAMPTZ NOT NULL,
+    symbol      TEXT NOT NULL,
+    model_name  TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    features    JSONB NOT NULL,
+    prediction  DOUBLE PRECISION NOT NULL,
+    action      TEXT NOT NULL,
+    actual      DOUBLE PRECISION,
+    actual_ts   TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_mlp_symbol_ts ON ml_predictions (symbol, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_mlp_model ON ml_predictions (model_name, model_version);
+
+-- 14. ML training runs
+CREATE TABLE IF NOT EXISTS ml_training_runs (
+    id              SERIAL PRIMARY KEY,
+    name            TEXT NOT NULL,
+    started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    finished_at     TIMESTAMPTZ,
+    status          TEXT NOT NULL DEFAULT 'running',
+    config          JSONB NOT NULL DEFAULT '{}'::jsonb,
+    metrics         JSONB NOT NULL DEFAULT '{}'::jsonb,
+    model_version   TEXT,
+    error           TEXT
+);

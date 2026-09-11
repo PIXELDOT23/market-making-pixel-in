@@ -31,6 +31,7 @@ class MarketTick(msgspec.Struct, frozen=True):
     ask: Optional[float] = None
     bid_size: int = 0
     ask_size: int = 0
+    volume: int = 0
     source: str = "fyers_ws"
 
     def as_dict(self) -> Dict[str, Any]:
@@ -52,7 +53,21 @@ class MarketSnapshot(msgspec.Struct):
     tick_count: int
     churn_ticks_per_sec: float
     last_tick_ts: float
+    volume: int
     is_connected: bool
+    bids: List["DepthLevel"] = msgspec.field(default_factory=list)
+    asks: List["DepthLevel"] = msgspec.field(default_factory=list)
+    # ML fields (populated by DataEngine when ML is enabled)
+    ml_adverse_prob: float = 0.0
+    ml_should_widen: bool = False
+    ml_extra_ticks: int = 0
+
+
+class DepthLevel(msgspec.Struct):
+    """One price level of the live order book (top of book onward)."""
+    price: float
+    qty: int
+    orders: int = 0
 
 
 # =============================================================================
@@ -66,12 +81,13 @@ class ChargeBreakdown(msgspec.Struct):
     sebi: float
     stamp: float
     gst: float
+    ipft: float = 0.0   # NSE investor-protection fund levy (₹1/lakh), NSE only
 
     @property
     def total(self) -> float:
         return round(
             self.brokerage + self.txn + self.stt_or_ctt + self.sebi
-            + self.stamp + self.gst, 2
+            + self.stamp + self.gst + self.ipft, 2
         )
 
 
@@ -223,6 +239,66 @@ class DecisionMetrics(msgspec.Struct):
     last_decision: str
 
 
+class AssetPnl(msgspec.Struct):
+    """Per-asset PnL + inventory view for the ranked-asset detail panel."""
+    symbol: str
+    position: int
+    entry: float
+    realized_pnl_rs: float        # spread collected, net after charges
+    unrealized_pnl_rs: float
+    total_pnl_rs: float
+    open_age_sec: float
+    lot_size: int
+    # last filled reference (for transparent closed-cycle breadcrumbs)
+    last_fill_price: float = 0.0
+
+
+class ScanCost(msgspec.Struct):
+    """Post-charges economics for one asset at quote size."""
+    net_profit_rs: float = 0.0        # net profit/cycle if we buy bid & sell ask
+    round_trip_charges_rs: float = 0.0
+    breakeven_spread_ticks: int = 0
+    required_spread_ticks: int = 0    # breakeven + min profit margin ticks
+    profitable: bool = False
+
+
+class ScannerRow(msgspec.Struct):
+    """One candidate asset ranked for market making by the scanner."""
+    symbol: str
+    rank: int                       # 1 = most attractive
+    segment: str                    # COMMODITY | EQUITY | EQUITY_FUT
+    asset_type: str                 # commodity_fut | equity_fut | equity
+    ltp: Optional[float]
+    bid: Optional[float]
+    ask: Optional[float]
+    mid: Optional[float]
+    bid_size: int
+    ask_size: int
+    spread_ticks: int
+    liquidity_grade: float          # 0..1 book depth ratio
+    churn_ticks_per_sec: float
+    vol_widening_ticks: int
+    quoteable: bool
+    margin_avail: float
+    margin_per_lot: float
+    quote_qty: int                  # dynamic size (lots or shares)
+    lot_size: int                   # contract multiplier: 1 lot = this many units (1 for cash equity)
+    score: float                    # composite market-making score
+    margin_req_rs: float = 0.0      # margin consumed by quote_qty at current book
+    net_profit_rs: float = 0.0      # net after charges if filled at current book
+    round_trip_charges_rs: float = 0.0
+    breakeven_spread_ticks: int = 0
+    required_spread_ticks: int = 0
+    profitable: bool = False        # net_profit_rs >= min net per cycle
+    weight: float = 0.0             # smoothed cycle-profit-per-margin (RoM) weight
+    size_mult: float = 1.0          # RoM-derived size multiplier (equity sizing)
+    bids: List["DepthLevel"] = msgspec.field(default_factory=list)
+    asks: List["DepthLevel"] = msgspec.field(default_factory=list)
+    reasons: List[str] = msgspec.field(default_factory=list)
+    ts: float = msgspec.field(default_factory=_now)
+    volume: int = 0
+
+
 # =============================================================================
 # Monitor / Heartbeat
 # =============================================================================
@@ -236,17 +312,26 @@ class EngineHeartbeat(msgspec.Struct):
     detail: str = ""
 
 
+class SegmentStatus(msgspec.Struct, kw_only=True):
+    segment: str
+    label: str
+    open: bool = False
+    close_in_sec: float = 0.0
+
+
 class PipelineSnapshot(msgspec.Struct, kw_only=True):
     ts: float
     engines: List[EngineHeartbeat] = msgspec.field(default_factory=list)
     strategies: List[StrategyInfo] = msgspec.field(default_factory=list)
     decisions: List[DecisionMetrics] = msgspec.field(default_factory=list)
     markets: List[MarketSnapshot] = msgspec.field(default_factory=list)
+    scanner: List[ScannerRow] = msgspec.field(default_factory=list)
     risk_active: bool
     risk_healthy: bool
     risk_halts: List[str] = msgspec.field(default_factory=list)
     session_open: bool = True
     session_close_in_sec: float = 0.0
+    segments: List[SegmentStatus] = msgspec.field(default_factory=list)
 
 
 class Command(msgspec.Struct):
@@ -254,6 +339,53 @@ class Command(msgspec.Struct):
     type: str                          # PAUSE_STRATEGY, RESUME_STRATEGY, FLATTEN, HALT_ALL, RESET
     target: str = "*"
     ts: float = msgspec.field(default_factory=_now)
+
+
+# =============================================================================
+# ML
+# =============================================================================
+class OrderBookDepth(msgspec.Struct):
+    """Full 5-level depth snapshot persisted for training."""
+    ts: float
+    symbol: str
+    ltp: float
+    mid: float
+    spread: float
+    bids: List[Dict[str, Any]] = msgspec.field(default_factory=list)
+    asks: List[Dict[str, Any]] = msgspec.field(default_factory=list)
+    volume: int = 0
+    churn_tps: float = 0.0
+
+
+class MLFeatures(msgspec.Struct):
+    """Computed feature vector for ML inference."""
+    ts: float
+    symbol: str
+    features: Dict[str, float] = msgspec.field(default_factory=dict)
+    label: Optional[float] = None
+    label_ts: Optional[float] = None
+
+
+class MLModelMeta(msgspec.Struct):
+    """Model registry entry."""
+    name: str
+    version: str
+    model_path: str
+    feature_names: List[str] = msgspec.field(default_factory=list)
+    train_samples: int = 0
+    train_auc: float = 0.0
+    val_auc: float = 0.0
+    active: bool = False
+
+
+class MLPrediction(msgspec.Struct):
+    """Logged inference result."""
+    ts: float
+    symbol: str
+    model_name: str
+    model_version: str
+    prediction: float
+    action: str                          # "WIDEN" | "HOLD" | "SKIP"
 
 
 json_codec = msgspec.json
@@ -271,6 +403,7 @@ def decode(cls, payload: bytes):
 STRUCT_REGISTRY: Dict[str, type] = {
     "MarketTick": MarketTick,
     "MarketSnapshot": MarketSnapshot,
+    "DepthLevel": DepthLevel,
     "ChargeBreakdown": ChargeBreakdown,
     "CostQuote": CostQuote,
     "SignalMetrics": SignalMetrics,
@@ -283,7 +416,13 @@ STRUCT_REGISTRY: Dict[str, type] = {
     "QuoteState": QuoteState,
     "StrategyInfo": StrategyInfo,
     "DecisionMetrics": DecisionMetrics,
+    "ScannerRow": ScannerRow,
     "EngineHeartbeat": EngineHeartbeat,
     "PipelineSnapshot": PipelineSnapshot,
+    "SegmentStatus": SegmentStatus,
     "Command": Command,
+    "OrderBookDepth": OrderBookDepth,
+    "MLFeatures": MLFeatures,
+    "MLModelMeta": MLModelMeta,
+    "MLPrediction": MLPrediction,
 }

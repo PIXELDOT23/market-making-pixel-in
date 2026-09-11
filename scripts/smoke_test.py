@@ -9,7 +9,7 @@ Verifies the full low-latency pipeline wiring:
   data -> signal -> cost -> strategy -> risk -> execution -> monitor
 
 Usage:
-    DATABASE_URL=postgresql://postgres@localhost:5433/market_making \
+    DATABASE_URL=postgresql://postgres:PixelIn@localhost:5432/pixel_in \
     python scripts/smoke_test.py
 """
 
@@ -26,7 +26,7 @@ sys.path.insert(0, PROJECT_ROOT)
 
 os.environ.setdefault("FYERS_CLIENT_ID", "smoketest")
 os.environ.setdefault(
-    "DATABASE_URL", "postgresql://postgres@localhost:5433/market_making"
+    "DATABASE_URL", "postgresql://postgres:PixelIn@localhost:5432/pixel_in"
 )
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379/1")
 
@@ -225,12 +225,12 @@ async def main():
         verdicts = await manager.db.fetch_all("SELECT count(*) AS n FROM risk_verdicts", {})
         decisions = await manager.db.fetch_all("SELECT count(*) AS n FROM decisions", {})
         hbs = await manager.db.fetch_all("SELECT count(*) AS n FROM engine_heartbeats", {})
-        print("\nDB row counts:")
+        print("\nDB row counts (empty = Postgres disabled/unreachable):")
         for label, r in [
             ("market_ticks", ticks), ("signals", sig), ("risk_verdicts", verdicts),
             ("decisions", decisions), ("engine_heartbeats", hbs),
         ]:
-            print(f"  {label}={r[0]['n']}")
+            print(f"  {label}={r[0]['n'] if r else 0}")
 
         os_ds: FakeOrderSocket = await wait_connected(manager.engines["execution"], "_ws")
         if os_ds is None:

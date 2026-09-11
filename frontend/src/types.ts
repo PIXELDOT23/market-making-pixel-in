@@ -47,7 +47,80 @@ export interface MarketSnapshot {
   tick_count: number
   churn_ticks_per_sec: number
   last_tick_ts: number
+  volume: number
   is_connected: boolean
+  bids?: DepthLevel[]
+  asks?: DepthLevel[]
+}
+
+export interface DepthLevel {
+  price: number
+  qty: number
+  orders: number
+}
+
+export interface ScannerRow {
+  symbol: string
+  rank: number
+  segment: string
+  asset_type: string
+  ltp: number | null
+  bid: number | null
+  ask: number | null
+  mid: number | null
+  bid_size: number
+  ask_size: number
+  spread_ticks: number
+  liquidity_grade: number
+  churn_ticks_per_sec: number
+  vol_widening_ticks: number
+  volume: number
+  quoteable: boolean
+  margin_avail: number
+  margin_per_lot: number
+  quote_qty: number
+  lot_size: number
+  margin_req_rs: number
+  score: number
+  net_profit_rs: number
+  round_trip_charges_rs: number
+  breakeven_spread_ticks: number
+  required_spread_ticks: number
+  profitable: boolean
+  weight: number
+  size_mult: number
+  reasons: string[]
+  ts: number
+}
+
+export interface AssetPnl {
+  symbol: string
+  position: number
+  entry: number
+  realized_pnl_rs: number
+  unrealized_pnl_rs: number
+  total_pnl_rs: number
+  open_age_sec: number
+  lot_size: number
+  last_fill_price: number
+}
+
+export interface AssetDetail {
+  symbol: string
+  ts: number | null
+  session_open: boolean
+  session_label: string
+  snapshot: MarketSnapshot | null
+  row: ScannerRow | null
+  pnl: AssetPnl | null
+  strategy: DecisionMetrics | null
+}
+
+export interface SegmentStatus {
+  segment: string
+  label: string
+  open: boolean
+  close_in_sec: number
 }
 
 export interface PipelineSnapshot {
@@ -56,11 +129,13 @@ export interface PipelineSnapshot {
   strategies: StrategyInfo[]
   decisions: DecisionMetrics[]
   markets: MarketSnapshot[]
+  scanner: ScannerRow[]
   risk_active: boolean
   risk_healthy: boolean
   risk_halts: string[]
   session_open: boolean
   session_close_in_sec: number
+  segments: SegmentStatus[]
 }
 
 export interface AuthInfo {

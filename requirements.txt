@@ -9,6 +9,13 @@ uvicorn[standard]>=0.30
 python-dotenv>=1.0
 requests>=2.31
 
+# --- ML (optional, graceful degrade if absent) ---
+# onnxruntime>=1.17
+# numpy>=1.24
+# xgboost>=2.0
+# onnxmltools>=1.12
+# onnxconverter-common>=1.13
+
 # --- dev ---
 # ruff
 # pytest

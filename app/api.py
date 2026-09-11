@@ -30,11 +30,15 @@ import msgspec
 
 
 def _session_open() -> bool:
-    return market_hours.is_open()
+    return market_hours.any_open()
 
 
 def _session_label() -> str:
-    return market_hours.session_label()
+    return " market open" if _session_open() else "closed"
+
+
+def _segments_status() -> list:
+    return market_hours.segment_status()
 
 
 class MsgspecResponse(Response):
@@ -72,6 +76,7 @@ def create_app(manager: EngineManager, lifespan=None) -> FastAPI:
             "postgres": db_ok,
             "session_open": _session_open(),
             "session_label": _session_label(),
+            "segments": _segments_status(),
         })
 
     @app.get("/api/auth")
@@ -81,13 +86,25 @@ def create_app(manager: EngineManager, lifespan=None) -> FastAPI:
         ts = manager.token_store
         if ts is None or not isinstance(ts, TokenStore):
             return MsgspecResponse({"logged_in": False, "reason": "auth store unavailable"})
-        return MsgspecResponse(await ts.live_status())
+        try:
+            return MsgspecResponse(await ts.live_status())
+        except Exception as exc:
+            # a Redis hiccup must never turn the auth check (or the frontend
+            # AuthBadge that polls it) into a 500
+            log.error(f"auth status failed: {exc!r}")
+            return MsgspecResponse({"logged_in": False, "reason": f"auth check failed: {exc!r}"})
 
     @app.get("/api/pipeline")
     async def pipeline():
         monitor = manager.engines.get("monitor")
         snap = monitor.latest_snapshot() if monitor else None
-        return MsgspecResponse(snap or manager._build_snapshot())
+        if snap is None:
+            try:
+                snap = manager._build_snapshot()
+            except Exception as exc:
+                log.error(f"pipeline snapshot build failed: {exc!r}")
+                return MsgspecResponse({"error": "snapshot unavailable"})
+        return MsgspecResponse(snap)
 
     @app.get("/api/strategies")
     async def strategies():
@@ -105,6 +122,58 @@ def create_app(manager: EngineManager, lifespan=None) -> FastAPI:
         out = [de.snapshot(s) for s in de.symbols] if de else []
         return MsgspecResponse([s for s in out if s is not None])
 
+    @app.get("/api/scanner")
+    async def scanner(segment: Optional[str] = None, top: int = 250):
+        """Ranked scanner list. ``top`` bounds the response; ``segment`` filters
+        to EQUITY/COMMODITY/EQUITY_FUT so the whole market stays displayable."""
+        se = manager.engines.get("strategy")
+        if se is None or not hasattr(se, "scanner_rows"):
+            return MsgspecResponse([])
+        rows = se.scanner_rows()
+        if segment:
+            seg_u = segment.lower()
+            # "equity" covers both cash EQUITY and EQUITY_FUT futures so the
+            # frontend's single NSE tab keeps working as NFO futures replace
+            # cash equities in the whole-market scan.
+            if seg_u == "equity":
+                rows = [r for r in rows if r.segment.lower() in ("equity", "equity_fut")]
+            else:
+                rows = [r for r in rows if r.segment.lower() == seg_u]
+        rows.sort(key=lambda r: r.rank)
+        return MsgspecResponse(rows[: max(1, top)])
+
+    @app.get("/api/asset/{symbol}")
+    async def asset(symbol: str):
+        """Ranked-asset detail: live order book, per-asset PnL (incl. spread
+        collected after charges) and the strategy's activity for that symbol."""
+        de = manager.engines.get("data")
+        re = manager.engines.get("risk")
+        se = manager.engines.get("strategy")
+
+        snap = de.snapshot(symbol) if de is not None else None
+        pnl = re.asset_pnl(symbol, mid=snap.mid if snap else None) if re is not None else None
+        row = None
+        strat_metric = None
+        if se is not None and hasattr(se, "scanner_rows"):
+            for r in se.scanner_rows():
+                if r.symbol == symbol:
+                    row = r
+                    break
+            for m in se.strategy_metrics():
+                if m.strategy == se._strategy_for_symbol(symbol):
+                    strat_metric = m
+                    break
+        return MsgspecResponse({
+            "symbol": symbol,
+            "ts": None if snap is None else snap.last_tick_ts,
+            "session_open": _session_open(),
+            "session_label": _session_label(),
+            "snapshot": snap,
+            "row": row,
+            "pnl": pnl,
+            "strategy": strat_metric,
+        })
+
     @app.get("/api/risk")
     async def risk():
         re = manager.engines.get("risk")
@@ -121,6 +190,16 @@ def create_app(manager: EngineManager, lifespan=None) -> FastAPI:
             ],
         })
 
+    @app.get("/api/ml")
+    async def ml_status():
+        from app.ml import engine as ml_engine
+        from app.ml import model as ml_model
+        return MsgspecResponse({
+            **ml_engine.status(),
+            "onnx_available": ml_model.is_available(),
+            "ml_enabled": settings.ml_enabled,
+        })
+
     @app.get("/api/orders")
     async def orders():
         ee = manager.engines.get("execution")
@@ -135,7 +214,10 @@ def create_app(manager: EngineManager, lifespan=None) -> FastAPI:
             "UNION ALL SELECT 'order_events', count(*) FROM order_events "
             "UNION ALL SELECT 'signals', count(*) FROM signals "
             "UNION ALL SELECT 'decisions', count(*) FROM decisions "
-            "UNION ALL SELECT 'engine_heartbeats', count(*) FROM engine_heartbeats"
+            "UNION ALL SELECT 'engine_heartbeats', count(*) FROM engine_heartbeats "
+            "UNION ALL SELECT 'order_book_depths', count(*) FROM order_book_depths "
+            "UNION ALL SELECT 'ml_features', count(*) FROM ml_features "
+            "UNION ALL SELECT 'ml_predictions', count(*) FROM ml_predictions"
         ) if manager.db else []
         return JSONResponse(rows)
 
@@ -170,16 +252,24 @@ def create_app(manager: EngineManager, lifespan=None) -> FastAPI:
         await ws.accept()
         bus = manager.bus
 
+        # A dead client must terminate the loop so its bus handler is
+        # unsubscribed. Redis handlers run in their own queue-drain task where
+        # a raise is swallowed + logged, so rely on a flag instead of
+        # exception propagation.
+        dead = asyncio.Event()
+
         async def forward(ch: str, raw: bytes):
             try:
                 ev = schema.decode(schema.OrderEvent, raw)
                 await ws.send_text(flask_encoder.encode(ev).decode())
+            except (WebSocketDisconnect, RuntimeError):
+                dead.set()
             except Exception:
                 pass
 
         await bus.subscribe("fyers:orders", handler=forward)
         try:
-            while True:
+            while not dead.is_set():
                 await asyncio.sleep(0.5)
         except (WebSocketDisconnect, RuntimeError):
             pass
@@ -197,17 +287,46 @@ def main_run(manager: EngineManager):
     uvicorn.run(create_app(manager), host=settings.api_host, port=settings.api_port)
 
 
+def _port_free(host: str, port: int) -> bool:
+    """Reserve the API port before anything else boots so a second runner can
+    never start engines and then flatten the live book just because uvicorn
+    failed to bind."""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind((host, port))
+            return True
+        except OSError:
+            return False
+
+
 async def boot_and_run(manager: EngineManager):
+    if not _port_free(settings.api_host, settings.api_port):
+        log.error(
+            f"API port {settings.api_host}:{settings.api_port} already in use — "
+            f"another bot instance is running. Aborting BEFORE boot so no live "
+            f"book is touched."
+        )
+        log.error(
+            "Find the stale instance with:  ss -ltnp | grep :8000   "
+            "(or pgrep -af 'python3 -m run')"
+        )
+        raise SystemExit(1)
     await manager.boot()
+    await manager.flatten_orphans_at_boot()
 
     @asynccontextmanager
     async def _lifespan(app: FastAPI):
         yield
         # uvicorn runs this on SIGINT/SIGTERM BEFORE it tears down the event
-        # loop. The loop is still live here — the ONLY place we can safely
-        # flatten/close the book. Once serve() returns, the loop is left in a
-        # wedged state where `await` (+ timeouts) never resumes.
+        # loop. The loop is still live here — the ONLY place where awaits can
+        # still resume. Once serve() returns, the loop is left in a wedged state
+        # where `await` (+ timeouts) never resumes, so flattening the book AND
+        # stopping every engine task (cancelling pending fan-out/heartbeat
+        # tasks) must all happen before that point.
         await manager.emergency_flatten()
+        await manager.shutdown()
 
     import uvicorn
     app = create_app(manager, lifespan=_lifespan)

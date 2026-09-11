@@ -37,12 +37,15 @@ class MonitorEngine(Engine):
         self.commands_processed = 0
         self.last_publish_ms = 0.0
         self._snapshot_buffer: Optional[schema.PipelineSnapshot] = None
+        self._publish_tasks: "set[asyncio.Task]" = set()
         self.close_events = 0
 
-        # market-close flatten latch: runs at most once per IST trading date
+        # market-close wind-down latches: ONE per segment, per IST trading date.
+        # Segment NSE (15:15 wind-down / 15:30 close) must square off its own
+        # book while MCX keeps quoting into the night (and vice-versa).
         self._session_date: str = ""
-        self._flattened_on_session = False
-        self._was_open = False
+        self._flattened_segments: Dict[str, str] = {}
+        self._seg_was_open: Dict[str, bool] = {}
 
     def set_snapshot_fn(self, fn: Callable[[], "schema.PipelineSnapshot"]):
         self.snapshot_fn = fn
@@ -110,72 +113,120 @@ class MonitorEngine(Engine):
         hb = asyncio.create_task(self._heartbeat_loop())
         while not self._stop.is_set():
             if self.snapshot_fn is not None:
-                t0 = time.perf_counter()
-                snap = self.snapshot_fn()
-                self._snapshot_buffer = snap
-                self._publish_snapshot(snap)
-                self.last_publish_ms = (time.perf_counter() - t0) * 1000
-                self._mark()
+                try:
+                    t0 = time.perf_counter()
+                    snap = self.snapshot_fn()
+                    self._snapshot_buffer = snap
+                    self._publish_snapshot(snap)
+                    self.last_publish_ms = (time.perf_counter() - t0) * 1000
+                    self._mark()
+                except Exception as exc:
+                    log.error(f"[monitor] snapshot build failed: {exc!r}")
 
-            await self._check_market_close()
+            try:
+                await self._check_market_close()
+            except Exception as exc:
+                log.error(f"[monitor] market-close check failed: {exc!r}")
 
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=1.0)
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 pass
         hb.cancel()
+        await self._shutdown_publish_tasks()
+
+    async def _shutdown_publish_tasks(self):
+        """Cancel and await every live snapshot-publish task so none is left
+        pending when the event loop closes."""
+        tasks = list(self._publish_tasks)
+        self._publish_tasks.clear()
+        for t in tasks:
+            t.cancel()
+        for t in tasks:
+            try:
+                await t
+            except BaseException:
+                pass
 
     # ------------------------------------------------------------------ market-close risk management
     async def _check_market_close(self):
         """
-        Session-aware safety net: when the exchange session for this asset is
-        about to end (or just ended), every position and resting order is
-        flattened through the risk/execution chain at most once per IST date.
+        Session-aware safety net that flattens EACH SEGMENT independently when
+        its own session is about to end (wind-down) or has just ended.
+
+        NSE closes at 15:30 IST: its wind-down (default 15 min -> 15:15) squares
+        off the NSE book and cancels resting NSE orders while MCX keeps quoting
+        into the night. MCX gets the same treatment near 23:30/23:55. A segment
+        is flattened at most once per IST trading date.
         """
         from app.infra import market_hours
 
-        now_open = market_hours.is_open()
-        secs_to_close = market_hours.seconds_until_close() if now_open else 0.0
+        statuses = market_hours.segment_status()
+        now_open = market_hours.any_open()
+        today = market_hours.ist_date()
 
         # roll the per-day latch
-        today = market_hours.ist_date()
         if today != self._session_date:
             self._session_date = today
-            self._flattened_on_session = False
+            self._flattened_segments = {}
+            self._seg_was_open = {}
 
         # keep the risk engine's market_hours constraint live even with no ticks
         risk = self._engines().get("risk")
         if risk is not None and hasattr(risk, "update_market_state"):
             risk.update_market_state(now_open)
 
-        guarded = (
-            (now_open and secs_to_close <= settings.close_flatten_seconds)
-            or (self._was_open and not now_open)
-        )
-        if guarded and not self._flattened_on_session:
-            await self._market_close_flatten(market_hours.session_label(), secs_to_close)
-            self._flattened_on_session = True
+        for st in statuses:
+            seg = st["segment"]
+            if seg in self._flattened_segments:
+                self._seg_was_open[seg] = st["open"]
+                continue
 
-        self._was_open = now_open
+            entering_winddown = (
+                st["open"]
+                and 0 < st["close_in_sec"] <= settings.close_winddown_seconds
+            ) if settings.close_winddown_seconds > 0 else False
+            just_closed = self._seg_was_open.get(seg, False) and not st["open"]
 
-    async def _market_close_flatten(self, session_label: str, secs_to_close: float):
+            if entering_winddown or just_closed:
+                self._flattened_segments[seg] = today
+                await self._mark_segment_close(seg, st["label"], st["close_in_sec"])
+
+            self._seg_was_open[seg] = st["open"]
+
+    async def _mark_segment_close(self, segment: str, session_label: str, secs_to_close: float):
         self.close_events += 1
-        log.warn(
-            f"[monitor] market session ending ({session_label}; {secs_to_close:.0f}s to close) "
-            f"— flattening all positions & canceling resting orders"
-        )
         execu = self._engines().get("execution")
-        risk = self._engines().get("risk")
-        if risk is not None and hasattr(risk, "update_market_state"):
-            risk.update_market_state(False)
-        if execu is not None and hasattr(execu, "flatten_all"):
-            try:
-                await asyncio.wait_for(execu.flatten_all(), timeout=30)
-            except asyncio.TimeoutError:
-                log.error("[monitor] market-close flatten timed out")
+        if execu is None or not hasattr(execu, "flatten_segment"):
+            log.warn(
+                f"[monitor] {segment} session ending ({session_label}; {secs_to_close:.0f}s to close) "
+                f"— flatten_segment unavailable, skipping"
+            )
+            return
+        log.warn(
+            f"[monitor] {segment} session wind-down ({session_label}; {secs_to_close:.0f}s to close) "
+            f"— squaring off {segment} positions & canceling resting {segment} orders"
+        )
+        try:
+            await asyncio.wait_for(execu.flatten_segment(segment), timeout=30)
+        except asyncio.TimeoutError:
+            log.error(f"[monitor] {segment} wind-down flatten timed out")
 
     def _publish_snapshot(self, snap: schema.PipelineSnapshot):
-        asyncio.create_task(self._publish_async(snap))
+        def _consume(t: asyncio.Task):
+            self._publish_tasks.discard(t)
+            try:
+                t.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                log.error(f"[monitor] publish task error: {exc!r}")
+        try:
+            task = asyncio.create_task(self._publish_async(snap))
+            self._publish_tasks.add(task)
+            task.add_done_callback(_consume)
+        except Exception:
+            pass
 
     async def _publish_async(self, snap: schema.PipelineSnapshot):
         try:

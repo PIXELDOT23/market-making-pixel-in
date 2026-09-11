@@ -1,7 +1,12 @@
 -- Apply this schema to your PostgreSQL instance:
 --   psql "$DATABASE_URL" -f db/schema.sql
 --
--- If the database does not exist yet, create it first (system cluster):
---   sudo -u postgres psql -c "CREATE USER market PASSWORD 'market';"
---   sudo -u postgres psql -c "CREATE DATABASE market_making OWNER market;"
---   sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE market_making TO market;"
+-- Canonical (development) database:
+--   server: localhost:5432   (system PostgreSQL 16)
+--   database: pixel_in
+--   user: postgres / password: PixelIn
+--
+--   PGPASSWORD=PixelIn psql -h localhost -p 5432 -U postgres -d pixel_in -f db/schema.sql
+--
+-- DATABASE_URL used by the app (config `database_url` / env DATABASE_URL):
+--   postgresql://postgres:PixelIn@localhost:5432/pixel_in
